@@ -21,6 +21,7 @@ import {
   deleteSessionMessageIndexes,
   getStats,
   getProjectCwdFromSessions,
+  getSessionCountByProject,
 } from "./database.js";
 
 const log = createLogger("db-indexer");
@@ -278,13 +279,17 @@ async function indexProject(projectDir) {
 
     // Generate display name from actual path (from session cwd)
     const displayName = await getProjectDisplayName(projectCwd);
+
+    // Use real session count from database, not the counter
+    const realSessionCount = getSessionCountByProject(projectName);
+
     upsertProject({
       name: projectName,
       displayName: displayName || decodeProjectName(projectName),
       fullPath: projectCwd || projectDir,
-      sessionCount,
+      sessionCount: realSessionCount,
       lastActivity: lastActivity ? lastActivity.toISOString() : null,
-      hasClaudeSessions: sessionCount > 0,
+      hasClaudeSessions: realSessionCount > 0,
     });
 
     return { projectName, filesProcessed: results.length, results };

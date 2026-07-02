@@ -377,6 +377,18 @@ function upsertSession(session) {
       Date.now(),
     );
   incrementVersion("sessions");
+  updateProjectSessionCount(session.projectName);
+}
+
+/**
+ * Get session count for a project
+ */
+function getSessionCountByProject(projectName) {
+  const database = getDatabase();
+  const result = database
+    .prepare("SELECT COUNT(*) as count FROM sessions WHERE project_name = ?")
+    .get(projectName);
+  return result.count;
 }
 
 /**
@@ -835,6 +847,7 @@ export {
   upsertSession,
   getSessions,
   getSessionCount,
+  getSessionCountByProject,
   getSession,
   updateSessionSummary,
   getProjectCwdFromSessions,
