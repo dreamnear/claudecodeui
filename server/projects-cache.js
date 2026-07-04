@@ -8,11 +8,17 @@
  */
 
 import crypto from "crypto";
+import { SESSION_PAGE_SIZE } from "../shared/sessionConstants.js";
 
 // Cache state
 let cachedProjects = [];
 let cacheVersion = 0;
 let cacheTimestamp = null;
+
+// Page size used by the sessions pagination endpoint (matches the frontend's
+// first-screen load). Used to derive sessionMeta.hasMore when the DB path
+// produces no sessionMeta of its own.
+const PAGE_SIZE = SESSION_PAGE_SIZE;
 
 // Promise-based initialization waiting
 let initResolvers = [];
@@ -69,6 +75,14 @@ function calculateLastActivity(project) {
     }
   }
 
+  // Fallback to the project's scalar lastActivity (set by db-indexer / DB path)
+  if (!lastActivity && project.lastActivity) {
+    const fromField = new Date(project.lastActivity);
+    if (!isNaN(fromField.getTime())) {
+      lastActivity = fromField;
+    }
+  }
+
   return lastActivity ? lastActivity.toISOString() : null;
 }
 
@@ -79,18 +93,28 @@ function toSlimProject(project) {
   const claudeCount = project.sessions?.length || 0;
   const cursorCount = project.cursorSessions?.length || 0;
   const codexCount = project.codexSessions?.length || 0;
+  const total = project.sessionCount ?? project.sessionMeta?.total ?? 0;
 
   return {
     name: project.name,
     displayName: project.displayName,
     fullPath: project.fullPath || project.path,
-    sessionCount: claudeCount + cursorCount + codexCount,
+    // Prefer the authoritative scalar (DB path via getProjectsFromDb), then the
+    // session list total (getProjects path), then fall back to array length.
+    sessionCount:
+      project.sessionCount ??
+      project.sessionMeta?.total ??
+      claudeCount + cursorCount + codexCount,
     lastActivity: calculateLastActivity(project),
-    hasClaudeSessions: claudeCount > 0,
-    hasCursorSessions: cursorCount > 0,
-    hasCodexSessions: codexCount > 0,
+    hasClaudeSessions: project.hasClaudeSessions ?? claudeCount > 0,
+    hasCursorSessions: project.hasCursorSessions ?? cursorCount > 0,
+    hasCodexSessions: project.hasCodexSessions ?? codexCount > 0,
     hasTaskmaster: project.taskmaster?.hasTaskmaster || false,
-    sessionMeta: project.sessionMeta,
+    // The DB path (getProjectsFromDb) does not produce sessionMeta, so derive a
+    // fallback from the logical total + PAGE_SIZE. Use ?? so legacy paths that
+    // already computed {hasMore, total} keep their value instead of being
+    // overwritten by `||`'s truthiness checks.
+    sessionMeta: project.sessionMeta ?? { total, hasMore: total > PAGE_SIZE },
     isManuallyAdded: project.isManuallyAdded || false,
     isCustomName: project.isCustomName || false,
   };

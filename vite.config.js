@@ -9,6 +9,11 @@ export default defineConfig(({ command, mode }) => {
   return {
     plugins: [react()],
     server: {
+      // Default to loopback so the dev server is only reachable locally.
+      // The production service is exposed via frpc on port 3001 and does not
+      // depend on the Vite dev server, so this does not affect deployments.
+      // Set VITE_HOST=0.0.0.0 in .env when you need remote dev access.
+      host: env.VITE_HOST || '127.0.0.1',
       port: parseInt(env.VITE_PORT) || 5173,
       proxy: {
         '/api': `http://localhost:${env.PORT || 3001}`,

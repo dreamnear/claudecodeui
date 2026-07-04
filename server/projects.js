@@ -65,6 +65,7 @@ import crypto from "crypto";
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
 import os from "os";
+import { SESSION_PAGE_SIZE } from "../shared/sessionConstants.js";
 
 // Import TaskMaster detection functions
 async function detectTaskMasterFolder(projectPath) {
@@ -427,7 +428,7 @@ async function getProjects() {
 
         // Try to get sessions for this project (just first 5 for performance)
         try {
-          const sessionResult = await getSessions(entry.name, 5, 0);
+          const sessionResult = await getSessions(entry.name, SESSION_PAGE_SIZE, 0);
           project.sessions = sessionResult.sessions || [];
           project.sessionMeta = {
             hasMore: sessionResult.hasMore,
@@ -587,7 +588,7 @@ async function getProjects() {
   return projects;
 }
 
-async function getSessions(projectName, limit = 5, offset = 0) {
+async function getSessions(projectName, limit = SESSION_PAGE_SIZE, offset = 0) {
   const projectDir = path.join(
     os.homedir(),
     ".claude",

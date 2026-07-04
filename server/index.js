@@ -68,6 +68,7 @@ import {
   extractProjectDirectory,
   clearProjectDirectoryCache,
 } from "./projects.js";
+import { SESSION_PAGE_SIZE } from "../shared/sessionConstants.js";
 import {
   queryClaudeSDK,
   abortClaudeSDKSession,
@@ -839,7 +840,7 @@ app.get(
   authenticateToken,
   async (req, res) => {
     try {
-      const { limit = 5, offset = 0 } = req.query;
+      const { limit = SESSION_PAGE_SIZE, offset = 0 } = req.query;
       const result = await getSessions(
         req.params.projectName,
         parseInt(limit),

@@ -1,4 +1,6 @@
 // Utility function for authenticated API calls
+import { SESSION_PAGE_SIZE } from "../../shared/sessionConstants";
+
 export const authenticatedFetch = (url, options = {}) => {
   const isPlatform = import.meta.env.VITE_IS_PLATFORM === "true";
   const token = localStorage.getItem("auth-token");
@@ -92,7 +94,7 @@ export const api = {
     authenticatedFetch(
       `/api/projects/${encodeURIComponent(projectName)}/detail`,
     ),
-  sessions: (projectName, limit = 5, offset = 0) =>
+  sessions: (projectName, limit = SESSION_PAGE_SIZE, offset = 0) =>
     authenticatedFetch(
       `/api/projects/${encodeURIComponent(projectName)}/sessions?limit=${limit}&offset=${offset}`,
     ),

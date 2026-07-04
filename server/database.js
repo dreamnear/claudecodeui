@@ -254,8 +254,7 @@ function upsertProject(project) {
       display_name = excluded.display_name,
       full_path = excluded.full_path,
       session_count = excluded.session_count,
-      last_activity = CASE WHEN excluded.last_activity > last_activity
-                          THEN excluded.last_activity ELSE last_activity END,
+      last_activity = excluded.last_activity,
       has_claude_sessions = excluded.has_claude_sessions OR has_claude_sessions,
       has_cursor_sessions = excluded.has_cursor_sessions OR has_cursor_sessions,
       has_codex_sessions = excluded.has_codex_sessions OR has_codex_sessions,
@@ -316,25 +315,29 @@ function getProjectsFromDb(timeframMs = null) {
 }
 
 /**
- * Update project session count
+ * Update project session count and last activity.
+ * session_count is the raw session count from the sessions table (COUNT(*)).
+ * The timeline view groups sessions server-side (server/projects.js), so the
+ * badge number may be slightly higher than the grouped entries the user sees
+ * (over-count only, never under-count). last_activity is derived from the
+ * sessions table MAX, symmetric to indexProject's getLastActivityByProject.
  */
 function updateProjectSessionCount(projectName) {
   const database = getDatabase();
-  const count = database
+  const sessionCount = getSessionCountByProject(projectName);
+  const row = database
     .prepare(
-      `
-    SELECT COUNT(*) as count FROM sessions WHERE project_name = ?
-  `,
+      "SELECT MAX(last_activity) AS last_activity FROM sessions WHERE project_name = ?",
     )
     .get(projectName);
-
   database
     .prepare(
-      `
-    UPDATE projects SET session_count = ?, updated_at = ? WHERE name = ?
-  `,
+      `UPDATE projects
+       SET session_count = ?, last_activity = ?, updated_at = ?
+       WHERE name = ?`,
     )
-    .run(count.count, Date.now(), projectName);
+    .run(sessionCount, row?.last_activity ?? null, Date.now(), projectName);
+  incrementVersion("projects");
 }
 
 // ============================================================
@@ -342,9 +345,20 @@ function updateProjectSessionCount(projectName) {
 // ============================================================
 
 /**
- * Upsert a session
+ * Upsert a session.
+ *
+ * @param {object} session - Session row fields (see INSERT column list).
+ * @param {object} [options]
+ * @param {boolean} [options.skipProjectAggregate=false] - When true, skip the
+ *   per-call `updateProjectSessionCount` refresh. Batch indexing writes many
+ *   sessions for one project in a row; recomputing the project's
+ *   COUNT(*) + MAX(...) after every write is O(N²). The caller is
+ *   expected to refresh the project aggregate once at the end of the batch
+ *   (see db-indexer.js indexProject -> upsertProject). The watcher path
+ *   (indexFile) keeps the default behavior so single-file increments still
+ *   refresh the project row immediately.
  */
-function upsertSession(session) {
+function upsertSession(session, options = {}) {
   const database = getDatabase();
   database
     .prepare(
@@ -377,7 +391,9 @@ function upsertSession(session) {
       Date.now(),
     );
   incrementVersion("sessions");
-  updateProjectSessionCount(session.projectName);
+  if (!options.skipProjectAggregate) {
+    updateProjectSessionCount(session.projectName);
+  }
 }
 
 /**
@@ -389,6 +405,22 @@ function getSessionCountByProject(projectName) {
     .prepare("SELECT COUNT(*) as count FROM sessions WHERE project_name = ?")
     .get(projectName);
   return result.count;
+}
+
+/**
+ * Get the most recent session activity timestamp for a project.
+ * Derived from the authoritative sessions table so it stays accurate even when
+ * processSessionFile skips unchanged files (incremental indexing).
+ */
+function getLastActivityByProject(projectName) {
+  const database = getDatabase();
+  const result = database
+    .prepare(
+      "SELECT MAX(last_activity) as last_activity FROM sessions WHERE project_name = ?",
+    )
+    .get(projectName);
+  const ts = result?.last_activity;
+  return ts ? new Date(ts).toISOString() : null;
 }
 
 /**
@@ -848,6 +880,7 @@ export {
   getSessions,
   getSessionCount,
   getSessionCountByProject,
+  getLastActivityByProject,
   getSession,
   updateSessionSummary,
   getProjectCwdFromSessions,

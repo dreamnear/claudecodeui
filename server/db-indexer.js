@@ -22,6 +22,7 @@ import {
   getStats,
   getProjectCwdFromSessions,
   getSessionCountByProject,
+  getLastActivityByProject,
 } from "./database.js";
 
 const log = createLogger("db-indexer");
@@ -31,9 +32,18 @@ const CLAUDE_PROJECTS_PATH = path.join(os.homedir(), ".claude", "projects");
 
 /**
  * Process a single session file incrementally
- * Only reads new bytes since last processing
+ * Only reads new bytes since last processing.
+ *
+ * @param {string} filePath - Path to the .jsonl session file.
+ * @param {string} projectName - Project key (basename of the project dir).
+ * @param {object} [options]
+ * @param {boolean} [options.skipProjectAggregate=false] - Forwarded to
+ *   upsertSession. Set true during batch indexing (indexProject) to avoid the
+ *   O(N²) per-write project aggregate refresh; the project row is refreshed
+ *   once at the end of the batch. Defaults to false so the watcher single-file
+ *   path still refreshes immediately.
  */
-async function processSessionFile(filePath, projectName) {
+async function processSessionFile(filePath, projectName, options = {}) {
   try {
     const stats = await fsPromises.stat(filePath);
     const fileState = getFileState(filePath);
@@ -177,16 +187,19 @@ async function processSessionFile(filePath, projectName) {
     }
 
     // Update session metadata
-    upsertSession({
-      id: sessionId,
-      projectName,
-      summary: finalSummary,
-      messageCount: messageNumber,
-      lastActivity: lastActivity ? lastActivity.toISOString() : null,
-      cwd,
-      provider: "claude",
-      filePath,
-    });
+    upsertSession(
+      {
+        id: sessionId,
+        projectName,
+        summary: finalSummary,
+        messageCount: messageNumber,
+        lastActivity: lastActivity ? lastActivity.toISOString() : null,
+        cwd,
+        provider: "claude",
+        filePath,
+      },
+      options,
+    );
 
     // Update file state
     updateFileState(filePath, byteOffset, stats.mtimeMs, stats.size);
@@ -246,29 +259,22 @@ async function indexProject(projectDir) {
       (f) => f.endsWith(".jsonl") && !f.startsWith("agent-"),
     );
 
-    let lastActivity = null;
-    let sessionCount = 0;
     let projectCwd = null;
     const results = [];
 
     for (const file of jsonlFiles) {
       const filePath = path.join(projectDir, file);
-      const result = await processSessionFile(filePath, projectName);
+      // Batch path: skip the per-write project aggregate refresh. The project
+      // row is refreshed once after the loop via upsertProject below, so we
+      // avoid N full COUNT(DISTINCT...) + MAX(...) scans of the sessions table.
+      const result = await processSessionFile(filePath, projectName, {
+        skipProjectAggregate: true,
+      });
       results.push(result);
 
-      if (!result.skipped) {
-        sessionCount++;
-        // Track project's last activity
-        if (result.lastActivity) {
-          const ts = new Date(result.lastActivity);
-          if (!lastActivity || ts > lastActivity) {
-            lastActivity = ts;
-          }
-        }
-        // Capture the first valid cwd for display name generation
-        if (!projectCwd && result.cwd) {
-          projectCwd = result.cwd;
-        }
+      // Capture the first valid cwd for display name generation
+      if (!result.skipped && !projectCwd && result.cwd) {
+        projectCwd = result.cwd;
       }
     }
 
@@ -280,15 +286,23 @@ async function indexProject(projectDir) {
     // Generate display name from actual path (from session cwd)
     const displayName = await getProjectDisplayName(projectCwd);
 
-    // Use real session count from database, not the counter
+    // Derive authoritative count and last activity from the sessions table.
+    // The JS accumulators above are only populated for non-skipped files, so on
+    // incremental runs (all files unchanged) they would reset to null/0. Reading
+    // from the DB keeps projects.* consistent with sessions regardless of skips.
+    // session_count is the raw session count (COUNT(*) on sessions). The
+    // timeline groups sessions server-side (server/projects.js), so this badge
+    // number may be slightly higher than the grouped entries the user sees
+    // (over-count only, never under-count).
     const realSessionCount = getSessionCountByProject(projectName);
+    const realLastActivity = getLastActivityByProject(projectName);
 
     upsertProject({
       name: projectName,
       displayName: displayName || decodeProjectName(projectName),
       fullPath: projectCwd || projectDir,
       sessionCount: realSessionCount,
-      lastActivity: lastActivity ? lastActivity.toISOString() : null,
+      lastActivity: realLastActivity,
       hasClaudeSessions: realSessionCount > 0,
     });
 

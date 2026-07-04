@@ -131,3 +131,7 @@ dev-debug.log
 tasks.json
 tasks/ 
 .fork-join/
+
+# MCP tool artifacts
+.playwright-mcp/
+.spec-workflow/

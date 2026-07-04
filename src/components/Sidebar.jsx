@@ -40,6 +40,7 @@ import TimeframeFilter from "./TimeframeFilter";
 import SessionListView from "./SessionListView";
 import useSessionsList from "../hooks/useSessionsList";
 import useProjectsList from "../hooks/useProjectsList";
+import { SESSION_PAGE_SIZE } from "../../shared/sessionConstants";
 
 // Move formatTimeAgo outside component to avoid recreation on every render
 const formatTimeAgo = (dateString, currentTime) => {
@@ -95,6 +96,10 @@ function Sidebar({
   const [loadingSessions, setLoadingSessions] = useState({});
   const [additionalSessions, setAdditionalSessions] = useState({});
   const [initialSessionsLoaded, setInitialSessionsLoaded] = useState(new Set());
+  // Projects whose first-page session fetch failed. Tracked separately so the
+  // auto-load effect can skip them (avoiding retry storms) and the UI can show
+  // an explicit retry control. Cleared on successful load or manual retry.
+  const [failedSessionLoads, setFailedSessionLoads] = useState(new Set());
   const [currentTime, setCurrentTime] = useState(new Date());
   const [projectSortOrder, setProjectSortOrder] = useState("name");
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -198,11 +203,17 @@ function Sidebar({
     return () => clearInterval(timer);
   }, []);
 
-  // Clear additional sessions when projects list changes (e.g., after refresh)
+  // Clear additional sessions when the filter SCOPE changes (timeframe/viewMode).
+  // We intentionally do NOT depend on `projects` here: the parent recreates that
+  // array on every WebSocket push and poll, and resetting on each change would
+  // discard already-loaded session pages and re-trigger the lazy-load effect
+  // below, producing redundant fetches. Manual refresh / new sessions are still
+  // reflected via the slim project metadata (sessionCount, hasMore).
   useEffect(() => {
     setAdditionalSessions({});
     setInitialSessionsLoaded(new Set());
-  }, [projects]);
+    setFailedSessionLoads(new Set());
+  }, [timeframe, viewMode]);
 
   // Auto-expand project folder when a session is selected
   useEffect(() => {
@@ -210,19 +221,6 @@ function Sidebar({
       setExpandedProjects((prev) => new Set([...prev, selectedProject.name]));
     }
   }, [selectedSession, selectedProject]);
-
-  // Mark sessions as loaded when projects come in
-  useEffect(() => {
-    if (projects.length > 0 && !isLoading) {
-      const newLoaded = new Set();
-      projects.forEach((project) => {
-        if (project.sessions && project.sessions.length >= 0) {
-          newLoaded.add(project.name);
-        }
-      });
-      setInitialSessionsLoaded(newLoaded);
-    }
-  }, [projects, isLoading]);
 
   // Load project sort order from settings
   useEffect(() => {
@@ -272,6 +270,37 @@ function Sidebar({
     }
     setExpandedProjects(newExpanded);
   };
+
+  // 展开项目时自动拉取首批会话（slim 项目懒加载入口）
+  useEffect(() => {
+    expandedProjects.forEach((name) => {
+      const project = projects.find((p) => p.name === name);
+      if (!project) return;
+      const hasSessions =
+        (project.sessions?.length || 0) +
+          (additionalSessions[project.name]?.length || 0) >
+        0;
+      // Skip projects that previously failed their first-page fetch: without
+      // this guard, a failed load (which sets neither initialSessionsLoaded nor
+      // any sessions) would leave the effect re-firing forever with no backoff.
+      // The user can retry explicitly via the UI.
+      if (
+        !hasSessions &&
+        !initialSessionsLoaded.has(name) &&
+        !failedSessionLoads.has(name) &&
+        !loadingSessions[name]
+      ) {
+        loadMoreSessions(project);
+      }
+    });
+  }, [
+    expandedProjects,
+    projects,
+    additionalSessions,
+    initialSessionsLoaded,
+    failedSessionLoads,
+    loadingSessions,
+  ]);
 
   // Wrapper to attach project context when session is clicked
   const handleSessionClick = (session, projectName) => {
@@ -532,9 +561,11 @@ function Sidebar({
 
   const loadMoreSessions = async (project) => {
     // Check if we can load more sessions
+    const alreadyLoaded = (additionalSessions[project.name]?.length || 0) > 0;
     const canLoadMore = project.sessionMeta?.hasMore !== false;
 
-    if (!canLoadMore || loadingSessions[project.name]) {
+    // 首次拉取（alreadyLoaded=false）放行；已加载过且无更多时早退
+    if ((alreadyLoaded && !canLoadMore) || loadingSessions[project.name]) {
       return;
     }
 
@@ -544,7 +575,11 @@ function Sidebar({
       const currentSessionCount =
         (project.sessions?.length || 0) +
         (additionalSessions[project.name]?.length || 0);
-      const response = await api.sessions(project.name, 5, currentSessionCount);
+      const response = await api.sessions(
+        project.name,
+        SESSION_PAGE_SIZE,
+        currentSessionCount,
+      );
 
       if (response.ok) {
         const result = await response.json();
@@ -555,17 +590,59 @@ function Sidebar({
           [project.name]: [...(prev[project.name] || []), ...result.sessions],
         }));
 
+        // 标记该项目的首批会话已加载（替代被删除的 "mark loaded" 死 effect）
+        setInitialSessionsLoaded((prev) => {
+          if (prev.has(project.name)) return prev;
+          const next = new Set(prev);
+          next.add(project.name);
+          return next;
+        });
+
+        // 成功后清除失败标记（用户重试 -> 恢复正常懒加载）
+        setFailedSessionLoads((prev) => {
+          if (!prev.has(project.name)) return prev;
+          const next = new Set(prev);
+          next.delete(project.name);
+          return next;
+        });
+
         // Update project metadata if needed
         if (result.hasMore === false) {
           // Mark that there are no more sessions to load
           project.sessionMeta = { ...project.sessionMeta, hasMore: false };
         }
+      } else {
+        // 登记失败，阻止 auto-load effect 立即重试（避免死循环）
+        setFailedSessionLoads((prev) => {
+          if (prev.has(project.name)) return prev;
+          const next = new Set(prev);
+          next.add(project.name);
+          return next;
+        });
       }
     } catch (error) {
       console.error("Error loading more sessions:", error);
+      setFailedSessionLoads((prev) => {
+        if (prev.has(project.name)) return prev;
+        const next = new Set(prev);
+        next.add(project.name);
+        return next;
+      });
     } finally {
       setLoadingSessions((prev) => ({ ...prev, [project.name]: false }));
     }
+  };
+
+  // 用户显式重试：清除失败标记后重新拉取。loadingSessions 由 loadMoreSessions
+  // 自己置位，auto-load effect 看到 loading=true 不会重复触发。
+  const retryLoadSessions = (project) => {
+    setFailedSessionLoads((prev) => {
+      if (!prev.has(project.name)) return prev;
+      const next = new Set(prev);
+      next.delete(project.name);
+      return next;
+    });
+    loadMoreSessions(project);
   };
 
   // Filter projects based on search input
@@ -1056,12 +1133,13 @@ function Sidebar({
                                       <p className="text-xs text-muted-foreground">
                                         {(() => {
                                           const sessionCount =
-                                            getAllSessions(project).length;
+                                            project.sessionCount || 0;
                                           const hasMore =
                                             project.sessionMeta?.hasMore !==
                                             false;
                                           const count =
-                                            hasMore && sessionCount >= 5
+                                            hasMore &&
+                                            sessionCount >= SESSION_PAGE_SIZE
                                               ? `${sessionCount}+`
                                               : sessionCount;
                                           return `${count} session${count === 1 ? "" : "s"}`;
@@ -1125,7 +1203,7 @@ function Sidebar({
                                         )}
                                       />
                                     </button>
-                                    {getAllSessions(project).length === 0 && (
+                                    {(project.sessionCount || 0) === 0 && (
                                       <button
                                         className="w-8 h-8 rounded-lg bg-red-500/10 dark:bg-red-900/30 flex items-center justify-center active:scale-90 border border-red-200 dark:border-red-800"
                                         onClick={(e) => {
@@ -1231,10 +1309,11 @@ function Sidebar({
                                   <div className="text-xs text-muted-foreground">
                                     {(() => {
                                       const sessionCount =
-                                        getAllSessions(project).length;
+                                        project.sessionCount || 0;
                                       const hasMore =
                                         project.sessionMeta?.hasMore !== false;
-                                      return hasMore && sessionCount >= 5
+                                      return hasMore &&
+                                        sessionCount >= SESSION_PAGE_SIZE
                                         ? `${sessionCount}+`
                                         : sessionCount;
                                     })()}
@@ -1317,7 +1396,7 @@ function Sidebar({
                                 >
                                   <Edit3 className="w-3 h-3" />
                                 </div>
-                                {getAllSessions(project).length === 0 && (
+                                {(project.sessionCount || 0) === 0 && (
                                   <div
                                     className="w-6 h-6 opacity-0 group-hover:opacity-100 transition-all duration-200 hover:bg-red-50 dark:hover:bg-red-900/20 flex items-center justify-center rounded cursor-pointer touch:opacity-100"
                                     onClick={(e) => {
@@ -1343,7 +1422,25 @@ function Sidebar({
                       {/* Sessions List */}
                       {isExpanded && (
                         <div className="ml-3 space-y-1 border-l border-border pl-3">
-                          {!initialSessionsLoaded.has(project.name) ? (
+                          {failedSessionLoads.has(project.name) &&
+                          !initialSessionsLoaded.has(project.name) ? (
+                            // First-page fetch failed: show explicit retry
+                            // instead of looping the loading skeleton.
+                            <div className="py-2 px-3 text-left">
+                              <p className="text-xs text-muted-foreground mb-1">
+                                Failed to load sessions
+                              </p>
+                              <button
+                                className="text-xs text-primary hover:underline disabled:opacity-50"
+                                onClick={() => retryLoadSessions(project)}
+                                disabled={loadingSessions[project.name]}
+                              >
+                                {loadingSessions[project.name]
+                                  ? "Retrying..."
+                                  : "Retry"}
+                              </button>
+                            </div>
+                          ) : !initialSessionsLoaded.has(project.name) ? (
                             // Loading skeleton for sessions
                             Array.from({ length: 3 }).map((_, i) => (
                               <div key={i} className="p-2 rounded-md">
